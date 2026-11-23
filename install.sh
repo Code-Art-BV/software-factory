@@ -106,8 +106,8 @@ if ! command -v agent-browser >/dev/null; then
 fi
 echo
 echo "Next:"
-echo "  1. Customize it for this repo: open Claude Code there and paste the prompt"
-echo "     from the Customize section of the software-factory README."
+echo "  1. Customize it for this repo: follow steps 2 to 4 of INSTALL.md in the"
+echo "     software-factory repository (or tell Claude Code to)."
 echo "  2. Make sure bash factory/checks.sh exits 0 on the base branch."
 echo "  3. Commit and push to the base branch (job worktrees are created from it)."
 echo "  4. Label an issue factory and run /factory run in Claude Code."

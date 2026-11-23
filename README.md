@@ -23,6 +23,37 @@ On the machine that runs the factory:
 
 ## Install
 
+Open Claude Code in your project and paste:
+
+```text
+Install this software factory in this project. Read INSTALL.md in the
+repository and follow it (the repo is private: use gh, not a web fetch):
+
+https://github.com/Code-Art-BV/software-factory
+```
+
+Your agent reads [`INSTALL.md`](INSTALL.md), runs the installer, fills
+`factory/checks.sh` with your project's real build, lint and test commands,
+tailors the agents and `CLAUDE.md` to your code, creates the GitHub labels,
+checks that `checks.sh` passes on the base branch, and commits. It asks before
+pushing.
+
+The installer adds this to the target repo:
+
+```
+factory/bin/{job,gate,route}     state machine, gate and routing scripts
+factory/config.json              concurrency, rounds, base branch, routing, prices
+factory/checks.sh                the repo's checks (the installing agent fills it in)
+factory/dashboard.html           job dashboard
+.claude/agents/*.md              intake, spec-writer, builder, 4 reviewers, approver
+.claude/skills/factory/SKILL.md  the /factory command
+```
+
+It also appends the factory's entries to `.gitignore` and `.gitattributes`,
+and Dev server, Validation and Software factory sections to `CLAUDE.md`.
+
+### By hand
+
 ```bash
 git clone https://github.com/Code-Art-BV/software-factory.git
 bash software-factory/install.sh /path/to/your/repo
@@ -36,49 +67,10 @@ bash software-factory/install.sh /path/to/your/repo
 | `--update` | Refresh only the scripts, dashboard and skill. Your agents, `config.json`, `checks.sh` and `CLAUDE.md` are left alone. |
 | `--force` | Overwrite an existing install, customizations included. |
 
-The installer adds this to the target repo:
-
-```
-factory/bin/{job,gate,route}     state machine, gate and routing scripts
-factory/config.json              concurrency, rounds, base branch, routing, prices
-factory/checks.sh                the repo's checks (you write these)
-factory/dashboard.html           job dashboard
-.claude/agents/*.md              intake, spec-writer, builder, 4 reviewers, approver
-.claude/skills/factory/SKILL.md  the /factory command
-```
-
-It also appends the factory's entries to `.gitignore` and `.gitattributes`,
-and Dev server, Validation and Software factory sections to `CLAUDE.md`.
-
-## Customize
-
-The template is generic. Before the first run, open Claude Code in the target
-repo and paste:
-
-> The software factory was just installed in this repo. Customize it:
->
-> 1. Write `factory/checks.sh`: this repo's build, lint and tests. It must be
->    fast, non-interactive, not rewrite tracked files, and exit 0 on the base
->    branch. Run it to prove it.
-> 2. In `CLAUDE.md`, fill in the Dev server section (replace the
->    `<!-- factory: ... -->` comment): how to start the app on a given port,
->    what it connects to, how to reach pages behind sign-in, and what agents
->    must never do with it. List the real commands of `checks.sh` under
->    Validation.
-> 3. In `.claude/agents/`, replace every `<!-- project:begin ... -->` comment
->    (keep nothing of the comment, and remove the `<!-- project:end -->` line)
->    with what it asks for, based on the real code: `intake.md`,
->    `approver.md`, `reviewer-security.md`, `reviewer-ui.md`, `reviewer-ux.md`.
->    Cite real paths.
-> 4. Check whether merging to the base branch deploys anything (CI workflows).
->    If it does and `approver.md` doesn't already forbid APPROVE, tell me.
-> 5. Check that `.gitignore` doesn't ignore `factory/bin/`, `.claude/agents/`
->    or `.claude/skills/`.
->
-> Don't change `factory/bin/*`, `factory/dashboard.html` or the skill.
-
-Then commit and push to the base branch: job worktrees are created from it, so
-agents only see what is there.
+The template is generic, so customize it before the first run: open Claude
+Code in the target repo and tell it to follow steps 2 to 4 of
+[`INSTALL.md`](INSTALL.md). Job worktrees are created from the base branch, so
+agents only see what is committed and pushed there.
 
 ## Use
 
@@ -112,6 +104,9 @@ only to issues you would hand to a contractor.
 
 ## Updating an install
 
+Tell your agent to update the software factory from the link above (it follows
+the last section of `INSTALL.md`), or by hand:
+
 ```bash
 git -C software-factory pull
 bash software-factory/install.sh --update /path/to/your/repo
@@ -120,6 +115,7 @@ bash software-factory/install.sh --update /path/to/your/repo
 ## This repo
 
 ```
+INSTALL.md        instructions for the installing agent
 install.sh        the installer
 lib/configure.py  its helper for config and text files
 template/         what gets copied into the target repo
