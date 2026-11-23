@@ -1,0 +1,4 @@
+# Run by bash and by shebang, so they need LF endings on Windows checkouts too
+/install.sh text eol=lf
+/template/factory/checks.sh text eol=lf
+/template/factory/bin/* text eol=lf
