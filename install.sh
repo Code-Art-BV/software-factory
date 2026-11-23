@@ -82,6 +82,9 @@ for f in factory/bin/job .claude/agents/intake.md .claude/skills/factory/SKILL.m
   if git check-ignore -q "$f"; then WARN="$WARN  $f"$'\n'; fi
 done
 
+# Stage the scripts with the executable bit, which Windows checkouts don't record.
+git add --chmod=+x factory/bin/gate factory/bin/job factory/bin/route factory/checks.sh
+
 if [ $LABELS = 1 ]; then
   gh label create factory --color 5319e7 --description "Queue for the software factory (/factory run)" --force \
   && gh label create "factory:needs-info" --color fbca04 --description "Factory intake is waiting for the author" --force \
