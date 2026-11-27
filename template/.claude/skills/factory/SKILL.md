@@ -145,7 +145,9 @@ finished:
   runs the gate again, pushes, and merges the PR, ending in `merged`. If any
   of that fails it moves the job to `needs-human` and says why.
 - `ESCALATE`: `factory/bin/job advance <id> needs-human`. It marks the PR ready,
-  posts the decision on it and labels the issue `factory:needs-human`.
+  posts the decision on it and labels the issue `factory:needs-human`. A
+  person answers by merging the PR, commenting on the PR or issue (the next
+  `job queue` shows a `feedback` line), or with `/factory <feedback>`.
 
 A job is finished for this run when it reaches `merged`, `rejected`,
 `needs-info` or `needs-human`.
@@ -153,21 +155,39 @@ A job is finished for this run when it reaches `merged`, `rejected`,
 A person can merge a job's PR by hand at any stage. `factory/bin/job queue`
 then moves the job to `merged`; stop any agents still running for it.
 
+## The watcher
+
+`factory/bin/watch` keeps the factory running: it polls GitHub and starts
+`claude -p "/factory run"` whenever new work comes in, one run at a time. While
+it is alive, it owns the jobs. Before you spawn any agent in this session, run
+`factory/bin/watch check`. If it exits non-zero, don't spawn agents and don't
+run the pipeline: make the state change the user asked for with the scripts
+(`job feedback`, `job reject`, `gh issue create`, ...), tell them the watcher
+picks it up on its next poll, and stop. Its exit is 0 inside the watcher's own
+run.
+
 ## /factory run
 
+0. Run `factory/bin/watch check` (see **The watcher**). If it exits non-zero,
+   print its message and stop.
 1. Run `factory/bin/job queue`. Each line is `action  issue  job  stage  note`:
-   `resume` (pick it up from its stage), `new` (no job yet), `hold` (no free
-   slot), `wait` (needs the author or you) or `skip`. The script enforces
-   `concurrency`: every job in a running stage holds a slot, and only as many
-   `new` and replied `needs-info` lines as there are free slots come out as
-   `new` or `resume`; the rest are `hold`. `job create` and the
-   `needs-info → intake` move refuse when no slot is free.
-2. Start every `resume` and `new` line, nothing else. Don't judge issues
-   yourself: every new issue goes to intake, which decides whether it gets
-   built. For a new issue, `factory/bin/job create <n>` prints the job id;
-   start it at **intake**.
+   `resume` (pick it up from its stage), `new` (no job yet), `feedback`
+   (someone with write access commented on a `needs-human` job's PR or issue),
+   `hold` (no free slot), `wait` (needs the author or you) or `skip`. The
+   script enforces `concurrency`: every job in a running stage holds a slot,
+   and only as many `new`, `feedback` and replied `needs-info` lines as there
+   are free slots come out as such; the rest are `hold`. `job create`, the
+   `needs-info → intake` move and `job feedback --github` refuse when no slot
+   is free.
+2. Start every `resume`, `new` and `feedback` line, nothing else. Don't judge
+   issues yourself: every new issue goes to intake, which decides whether it
+   gets built. For a new issue, `factory/bin/job create <n>` prints the job id;
+   start it at **intake**. For a `feedback` line, run
+   `factory/bin/job feedback <id> --github`: it saves the comments as
+   `feedback-<k>.md` and starts the next round. Go to **build** with
+   `The user gave feedback on GitHub: read feedback-<k>.md and address it, push, and update build.md for round <N>.`
 3. Each time a job finishes, run `factory/bin/job queue` again and start its
-   `resume` lines you aren't already running and its `new` lines.
+   `resume`, `new` and `feedback` lines you aren't already running.
 4. When nothing is queued or running, print `factory/bin/job summary <ids>`
    for the jobs this run touched, then list what waits on a human: PRs to
    review (merge one to approve it, or give feedback with `/factory`) and
@@ -184,7 +204,7 @@ as `resume`: run `factory/bin/job advance <id> intake` and go to **intake**.
 
 ## /factory run <n>
 
-Run one issue with the same steps. If `factory/bin/job queue` shows a job for
+Run one issue with the same steps, starting with step 0. If `factory/bin/job queue` shows a job for
 it, resume that job; otherwise `factory/bin/job create <n>`. Finish with the
 summary line for that job.
 
@@ -192,7 +212,8 @@ summary line for that job.
 
 Anything else after `/factory` is the user talking to the factory. Work out
 what they want and act on it. Every change of state still goes through the
-scripts. When it isn't clear which job they mean, or whether it's feedback or a
+scripts, and every "go to **build**" or "do **/factory run**" below applies
+only when `factory/bin/watch check` exits 0. When it isn't clear which job they mean, or whether it's feedback or a
 new feature, ask.
 
 - **A question** (status, cost, why a job escalated, what a reviewer said):

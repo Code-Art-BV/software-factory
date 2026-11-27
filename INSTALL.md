@@ -138,6 +138,11 @@ Then tell the user, in a few lines:
   `--human-merge`); the rest wait labeled `factory:needs-human`. Approve one
   by merging it on GitHub, or tell the factory what to change with
   `/factory <anything>`.
+- To keep the factory running, leave `factory/bin/watch` running in a
+  terminal: it starts `/factory run` headless whenever a `factory` issue
+  opens, an author answers a question, or someone comments on a PR that
+  needs a human. The run can't ask for permissions; see the README's "Keep it
+  running".
 - Intake runs on Fable, once per issue. Depending on their plan, Fable can
   bill to usage credits rather than the plan's included usage.
 - To start carefully, set `concurrency` to 1 in `factory/config.json` and read

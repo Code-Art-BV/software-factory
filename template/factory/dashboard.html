@@ -44,6 +44,17 @@
   }
   .status.error { color: var(--human); }
   .status.error .dot { background: var(--human); }
+  .watch { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-left: auto; }
+  .watch .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--faint); margin-right: 6px; vertical-align: 1px;
+  }
+  .watch.idle .dot { background: var(--pass); }
+  .watch.running { color: var(--active); }
+  .watch.running .dot { background: var(--active); animation: pulse 1.6s ease-in-out infinite; }
+  .watch.error { color: var(--human); }
+  .watch.error .dot { background: var(--human); }
+  @keyframes pulse { 50% { opacity: 0.3; } }
   .banner {
     margin: 12px 32px 0; padding: 10px 14px; border: 1px solid var(--human);
     border-radius: 8px; color: var(--human); font-family: var(--mono); font-size: 12px;
@@ -255,12 +266,14 @@
 <body>
 <header>
   <h1>Software factory</h1>
+  <div class="watch" id="watch" hidden></div>
   <div class="status" id="status">connecting…</div>
 </header>
 <div id="banner"></div>
 <main class="board" id="board"></main>
 <footer>
   <span>/factory run</span>
+  <span>factory/bin/watch</span>
   <span>/factory run &lt;n&gt;</span>
   <span>/factory &lt;anything&gt;</span>
   <span id="totals"></span>
@@ -438,6 +451,7 @@ async function poll() {
   try {
     jobs = await loadJobs()
     await render()
+    await renderWatch()
     if (openJobId) await refreshDrawer()
     status.className = 'status'
     status.innerHTML = `<span class="dot"></span>jobs/ · ${new Date().toLocaleTimeString()}`
@@ -445,6 +459,33 @@ async function poll() {
     status.className = 'status error'
     status.innerHTML = `<span class="dot"></span>${esc(err.message)}`
   }
+}
+
+// factory/bin/watch writes jobs/watch.json and refreshes its heartbeat at
+// least every interval while it lives.
+async function renderWatch() {
+  const el = $('watch')
+  let w
+  try { w = JSON.parse(await fetchText('jobs/watch.json')) } catch { el.hidden = true; return }
+  const time = (iso) => new Date(iso).toLocaleTimeString()
+  const stale = Date.now() - Date.parse(w.heartbeat) > Math.max(3 * w.interval, 120) * 1000
+  let cls = w.state, text
+  if (w.state === 'stopped' || stale) {
+    cls = 'off'
+    text = `watcher off · last seen ${time(w.heartbeat)}`
+  } else if (w.state === 'running') {
+    const why = (w.run.trigger || []).map(([action, issue]) => `#${issue} ${action}`).join(', ')
+    text = `watcher running /factory run since ${time(w.run.started)}${why ? ` · ${why}` : ''}`
+  } else if (w.state === 'error') {
+    text = `watcher can't poll GitHub: ${w.error}`
+  } else {
+    const left = (w.pending || []).length
+    text = `watcher idle · next check ${w.next_poll ? time(w.next_poll) : 'soon'}`
+      + (left ? ` · ${left} left from the last run, waiting for something new` : '')
+  }
+  el.className = `watch ${cls}`
+  el.innerHTML = `<span class="dot"></span>${esc(text)}`
+  el.hidden = false
 }
 
 // factory/bin/job writes each jobs/<id>/job.json.

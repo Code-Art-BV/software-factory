@@ -42,6 +42,7 @@ The installer adds this to the target repo:
 
 ```
 factory/bin/{job,gate,route}     state machine, gate and routing scripts
+factory/bin/watch                polls GitHub and runs /factory run on new work
 factory/config.json              concurrency, rounds, base branch, routing, prices
 factory/checks.sh                the repo's checks (the installing agent fills it in)
 factory/dashboard.html           job dashboard
@@ -87,6 +88,39 @@ http://localhost:8000/dashboard.html.
 
 Only issues labeled `factory` run; the label is the trust boundary, so give it
 only to issues you would hand to a contractor.
+
+### Keep it running
+
+```bash
+factory/bin/watch                    # poll GitHub every 60s until Ctrl-C
+factory/bin/watch --interval 30 --retry-after 30 -- --permission-mode auto --model opus
+factory/bin/watch status             # what the watcher is doing
+```
+
+The watcher polls GitHub with `gh` and starts `claude -p "/factory run"` in the
+repo root when there is new work, then waits for that run to finish before it
+looks again. New work is:
+
+- a new open issue labeled `factory`;
+- the author's reply to a NEEDS-INFO question on the issue;
+- a comment, review or inline review comment on a `needs-human` job's PR (or
+  its issue) by someone with write access to the repo. It becomes the job's
+  feedback, exactly like `/factory <feedback>`, and the builder takes another
+  round;
+- a PR merged by hand (the job moves to Done).
+
+Comments on a PR while its job is still running are not picked up: wait until
+it lands in Needs human. Work a run leaves unfinished (it crashed or hit a
+usage limit) doesn't restart the run by itself; it runs with the next change,
+or after `--retry-after` minutes.
+
+The run is headless, so everything it does must be allowed without a prompt.
+By default it gets `--permission-mode auto`; put your own Claude Code arguments
+after `--` to replace that (for example `--allowedTools ...` with a
+`.claude/settings.json` allowlist). Its output goes to `factory/jobs/watch.log`,
+and the dashboard header shows whether the watcher is idle, running or off.
+While a watcher is alive, `/factory` in an interactive session changes state
+but leaves starting agents to the watcher.
 
 ## Settings
 

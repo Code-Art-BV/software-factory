@@ -83,7 +83,7 @@ for f in factory/bin/job .claude/agents/intake.md .claude/skills/factory/SKILL.m
 done
 
 # Stage the scripts with the executable bit, which Windows checkouts don't record.
-git add --chmod=+x factory/bin/gate factory/bin/job factory/bin/route factory/checks.sh
+git add --chmod=+x factory/bin/gate factory/bin/job factory/bin/route factory/bin/watch factory/checks.sh
 
 if [ $LABELS = 1 ]; then
   gh label create factory --color 5319e7 --description "Queue for the software factory (/factory run)" --force \
@@ -110,4 +110,5 @@ echo "  1. Customize it for this repo: follow steps 2 to 4 of INSTALL.md in the"
 echo "     software-factory repository (or tell Claude Code to)."
 echo "  2. Make sure bash factory/checks.sh exits 0 on the base branch."
 echo "  3. Commit and push to the base branch (job worktrees are created from it)."
-echo "  4. Label an issue factory and run /factory run in Claude Code."
+echo "  4. Label an issue factory and run /factory run in Claude Code, or keep"
+echo "     factory/bin/watch running to pick up GitHub changes on its own."

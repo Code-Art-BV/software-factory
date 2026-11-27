@@ -12,6 +12,7 @@ Usage:
   job advance <job> <stage>      move a job to <stage>, or refuse
   job merge <job>                APPROVE → sync with the base branch, gate, merge the PR
   job feedback <job>             needs-human → build, with your feedback (stdin) as feedback-<k>.md
+  job feedback <job> --github    needs-human → build, with the new PR and issue comments as feedback-<k>.md
   job reject <job>               needs-info or needs-human → rejected, with your reason (stdin) as rejection.md
   job agents <job> <json>        record the routed agent set (called by factory/bin/route)
   job sync <job>                 refresh reviews, gate and cost from the job's files
@@ -249,6 +250,62 @@ def replied_since_question(issue):
         elif last_factory and c["author"]["login"] in {issue["author"]["login"], operator()}:
             replied = True
     return replied
+
+
+_repo = None
+_writers = {}
+
+
+def repo_name():
+    global _repo
+    if _repo is None:
+        _repo = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner").strip()
+    return _repo
+
+
+def can_write(login):
+    """The operator and people with write access to the repo: who may steer a job from GitHub."""
+    if not login or login.endswith("[bot]"):
+        return False
+    if login == operator():
+        return True
+    if login not in _writers:
+        res = run(["gh", "api", f"repos/{repo_name()}/collaborators/{login}/permission",
+                   "--jq", ".permission"], check=False)
+        _writers[login] = res.returncode == 0 and res.stdout.strip() in {"admin", "write"}
+    return _writers[login]
+
+
+def login_of(c, key="author"):
+    return (c.get(key) or {}).get("login", "")
+
+
+def github_feedback(job):
+    """Comments, reviews and inline review comments that people with write
+    access left on a needs-human job's issue and PR since it escalated, oldest
+    first, as (time, login, where, body)."""
+    since = job["ended"] or job["started"]
+    found = []
+
+    def add(login, when, where, body):
+        body = (body or "").strip()
+        if when and when > since and body and not body.startswith(MARKER) and can_write(login):
+            found.append((when, login, where, body))
+
+    for c in fetch_issue(job["issue"])["comments"]:
+        add(login_of(c), c["createdAt"], f"issue #{job['issue']}", c["body"])
+    if job["pr"]:
+        n = job["pr"]
+        pr = gh_json("pr", "view", str(n), "--json", "comments,reviews")
+        for c in pr["comments"]:
+            add(login_of(c), c["createdAt"], f"PR #{n}", c["body"])
+        for r in pr["reviews"]:
+            add(login_of(r), r.get("submittedAt"), f"PR #{n} review, {r['state'].lower().replace('_', ' ')}", r["body"])
+        inline = gh("api", "--paginate", f"repos/{repo_name()}/pulls/{n}/comments", "--jq",
+                    ".[] | {login: .user.login, created_at, path, line: (.line // .original_line), body}")
+        for c in map(json.loads, filter(None, inline.splitlines())):
+            add(c["login"], c["created_at"], f"PR #{n}, {c['path']}:{c['line']}", c["body"])
+    return sorted(found)
 
 
 def comment(kind, number, body):
@@ -589,8 +646,15 @@ def cmd_queue():
             else:
                 other_rows.append(("wait", n, j["id"], j["stage"], "waiting for the author"))
         elif j["stage"] == "needs-human":
-            other_rows.append(("wait", n, j["id"], j["stage"], f"merge PR #{j['pr']}, or give feedback"
-                               if j["pr"] else "give feedback"))
+            feedback = github_feedback(j)
+            if feedback:
+                who = ", ".join(sorted({f"@{f[1]}" for f in feedback}))
+                replied_rows.append(("feedback", n, j["id"], j["stage"],
+                                     f"{len(feedback)} new comment(s) from {who}"))
+            else:
+                other_rows.append(("wait", n, j["id"], j["stage"],
+                                   f"merge PR #{j['pr']}, or comment on it" if j["pr"]
+                                   else "comment on the issue, or give feedback"))
         elif j["stage"] == "rejected":
             other_rows.append(("skip", n, j["id"], j["stage"], f"rejected; delete factory/jobs/{j['id']} to retry"))
         elif j["stage"] == "merged":
@@ -651,14 +715,25 @@ def cmd_merge(job):
     print(f"{job['id']}: merged PR #{job['pr']}")
 
 
-def cmd_feedback(job, text):
+def cmd_feedback(job, text=None):
+    """`text` is the operator's words; None takes the feedback from GitHub."""
     if job["stage"] != "needs-human":
         die(f"{job['id']} is in {job['stage']}, not needs-human")
-    if not text.strip():
-        die("no feedback on stdin")
     d = job_dir(job["id"])
     k = len(list(d.glob("feedback-*.md"))) + 1
-    (d / f"feedback-{k}.md").write_text(f"# Feedback {k}\n\nFrom @{operator()} after the job escalated.\n\n{text.strip()}\n")
+    if text is None:
+        require_slot(job["id"])
+        found = github_feedback(job)
+        if not found:
+            die(f"no new comments on issue #{job['issue']}" + (f" or PR #{job['pr']}" if job["pr"] else ""))
+        parts = [f"# Feedback {k}\n\nLeft on GitHub after the job escalated, by people with write access to the repo."]
+        parts += [f"### @{login} on {where}, {when}\n\n{body}" for when, login, where, body in found]
+        body = "\n\n".join(parts) + "\n"
+    else:
+        if not text.strip():
+            die("no feedback on stdin")
+        body = f"# Feedback {k}\n\nFrom @{operator()} after the job escalated.\n\n{text.strip()}\n"
+    (d / f"feedback-{k}.md").write_text(body)
     save(advance(sync(job), "build"))
     print(f"{job['id']}: feedback-{k}.md, round {job['round']}")
 
@@ -716,6 +791,8 @@ def main(argv):
             print(f"{job['id']}: {job['stage']} (round {job['round']})")
         elif cmd == "merge" and len(args) == 1:
             cmd_merge(resolve(args[0]))
+        elif cmd == "feedback" and len(args) == 2 and args[1] == "--github":
+            cmd_feedback(resolve(args[0]))
         elif cmd == "feedback" and len(args) == 1:
             cmd_feedback(resolve(args[0]), sys.stdin.read())
         elif cmd == "reject" and len(args) == 1:

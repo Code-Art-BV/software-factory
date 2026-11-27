@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Keep the factory running: poll GitHub and start `/factory run` when there's new work.
+
+Usage:
+  watch [options] [-- <claude args>...]   poll until Ctrl-C
+  watch status                            the watcher's state, for people
+  watch check                             exit 0 if this session may orchestrate jobs,
+                                          1 if a live watcher owns them
+
+Options:
+  --interval <seconds>      time between GitHub polls (default 60)
+  --retry-after <minutes>   also rerun when leftover work hasn't changed for this
+                            long, e.g. after a run hit a usage limit (default: never)
+  --run-timeout <minutes>   stop a run that takes longer than this (default: never)
+
+Every poll runs `factory/bin/job queue`. When it shows work the last run didn't
+leave behind (a new `factory` issue, an author's reply to a NEEDS-INFO
+question, a comment on a needs-human job's PR or issue, a job sent back with
+`/factory <feedback>`), the watcher runs `claude -p "/factory run"` in the repo
+root and waits for it to finish before it polls again. One run at a time.
+
+Arguments after `--` replace the default Claude Code arguments
+(`--permission-mode auto`). The run is headless, so whatever it needs must be
+allowed without a prompt.
+
+State goes to factory/jobs/watch.json (the dashboard shows it), the runs'
+output to factory/jobs/watch.log.
+"""
+
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+if sys.platform == "win32" and not sys.flags.utf8_mode:  # Windows port: see factory/bin/job
+    sys.exit(subprocess.run([sys.executable, "-X", "utf8", *sys.argv]).returncode)
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+    import msvcrt
+
+REPO = Path(__file__).resolve().parents[2]
+FACTORY = REPO / "factory"
+JOBS = FACTORY / "jobs"
+STATE = JOBS / "watch.json"
+LOG = JOBS / "watch.log"
+JOB = FACTORY / "bin" / "job"
+CHILD_ENV = "FACTORY_WATCH_RUN"
+DEFAULT_CLAUDE_ARGS = ["--permission-mode", "auto"]
+# Rows that mean an orchestrator has something to do. `hold` counts: a new
+# issue waiting for a slot that jobs left over from a dead run are holding.
+ACTIONABLE = {"new", "resume", "feedback", "hold"}
+HEADLESS = (
+    "You were started by factory/bin/watch, headless: nobody reads this session "
+    "while it runs and nobody can answer a question. Never ask; when a job needs "
+    "a person, the factory's needs-info and needs-human stages are how you ask."
+)
+LOG_MAX_BYTES = 5_000_000
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def read_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def alive(state):
+    """A watcher is alive while it keeps its heartbeat fresh."""
+    if not state or state.get("state") == "stopped":
+        return False
+    limit = max(3 * state.get("interval", 60), 120)
+    return time.time() - parse_time(state["heartbeat"]) < limit
+
+
+# ---- status / check ---------------------------------------------------------
+
+
+def cmd_status():
+    s = read_state()
+    if not s:
+        print("no watcher has run here")
+        return
+    if not alive(s):
+        print(f"not running (last heartbeat {s['heartbeat']}, state {s['state']})")
+        return
+    print(f"pid {s['pid']} on {s['host']}, {s['state']}, polling every {s['interval']}s")
+    if s.get("run"):
+        r = s["run"]
+        print(f"run started {r['started']}" + (f", ended {r['ended']} (exit {r['exit']})" if r.get("ended") else ""))
+    for row in s.get("pending", []):
+        print("pending  " + "  ".join(str(c) for c in row))
+    if s.get("error"):
+        print(f"error: {s['error']}")
+
+
+def cmd_check():
+    """For /factory: a live watcher owns the jobs unless this is its own run."""
+    if os.environ.get(CHILD_ENV):
+        return 0
+    s = read_state()
+    if alive(s):
+        print(f"factory/bin/watch is running (pid {s['pid']} on {s['host']}, {s['state']}); "
+              "it starts every job. Change state with the scripts, but don't spawn agents: "
+              "the watcher picks the change up on its next poll.")
+        return 1
+    return 0
+
+
+# ---- the loop ---------------------------------------------------------------
+
+
+class Watcher:
+    def __init__(self, interval, retry_after, run_timeout, claude_args):
+        self.interval = interval
+        self.retry_after = retry_after
+        self.run_timeout = run_timeout
+        self.claude_args = claude_args
+        self.state = {
+            "pid": os.getpid(), "host": socket.gethostname(), "state": "starting",
+            "interval": interval, "started": now(), "heartbeat": now(),
+            "last_poll": None, "next_poll": None, "pending": [], "run": None,
+            "runs": 0, "error": None,
+        }
+        self.child = None
+        self.stopping = False
+
+    def save(self, **fields):
+        self.state.update(fields, heartbeat=now())
+        tmp = STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.state, indent=2) + "\n")
+        tmp.replace(STATE)
+
+    def log(self, msg):
+        line = f"[{now()}] watch: {msg}"
+        print(line, flush=True)
+        with LOG.open("a") as f:
+            f.write(line + "\n")
+
+    def queue(self):
+        res = subprocess.run([sys.executable, str(JOB), "queue"], cwd=REPO, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError((res.stderr or res.stdout).strip() or f"job queue exited {res.returncode}")
+        return [line.split("\t") for line in res.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def work(rows):
+        """Actionable rows, keyed by what the run would do, not by slot availability."""
+        return {(r[1], r[2], r[3]): r for r in rows if r[0] in ACTIONABLE}
+
+    def sleep(self, seconds):
+        end = time.time() + seconds
+        while not self.stopping and time.time() < end:
+            time.sleep(min(5, end - time.time()))
+
+    def rotate_log(self):
+        if LOG.exists() and LOG.stat().st_size > LOG_MAX_BYTES:
+            LOG.replace(LOG.with_suffix(".log.1"))
+
+    def run_claude(self, trigger):
+        self.rotate_log()
+        cmd = [shutil.which("claude") or "claude", "-p", "/factory run",
+               "--append-system-prompt", HEADLESS, *self.claude_args]
+        self.log("starting /factory run for: " + ", ".join(f"#{r[1]} {r[0]} ({r[4]})" for r in trigger))
+        run = {"started": now(), "ended": None, "exit": None,
+               "trigger": [r[:2] + [r[4]] for r in trigger]}
+        self.save(state="running", run=run, pending=[], runs=self.state["runs"] + 1)
+        with LOG.open("a") as log:
+            # Its own process group, so stopping a run also stops what it started.
+            group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
+                     else {"start_new_session": True})
+            self.child = subprocess.Popen(cmd, cwd=REPO, stdin=subprocess.DEVNULL, stdout=log,
+                                          stderr=subprocess.STDOUT, env={**os.environ, CHILD_ENV: "1"},
+                                          **group)
+            started = time.time()
+            while self.child.poll() is None:
+                if self.stopping:
+                    self.log("stopping the running /factory run; job state is in files, "
+                             "so the next run resumes it")
+                    self.stop_child()
+                    break
+                if self.run_timeout and time.time() - started > self.run_timeout * 60:
+                    self.log(f"the run passed --run-timeout {self.run_timeout}m; stopping it")
+                    self.stop_child()
+                    break
+                self.save()  # heartbeat
+                try:
+                    self.child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        code = self.child.returncode
+        self.child = None
+        run.update(ended=now(), exit=code)
+        self.save(state="idle", run=run)
+        self.log(f"/factory run ended with exit {code}")
+
+    def stop_child(self):
+        if not self.child or self.child.poll() is not None:
+            return
+
+        def signal_group(sig):
+            if sys.platform == "win32":  # taskkill /T stops the whole tree
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.child.pid)], capture_output=True)
+            else:
+                try:
+                    os.killpg(self.child.pid, sig)
+                except ProcessLookupError:
+                    pass
+        signal_group(signal.SIGTERM)
+        try:
+            self.child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            signal_group(signal.SIGKILL if sys.platform != "win32" else None)
+            self.child.wait()
+        if sys.platform != "win32":
+            signal_group(signal.SIGTERM)  # stragglers the leader left behind
+
+    def loop(self):
+        # Work the last run left unfinished. It doesn't start another run by
+        # itself: something new has to come in, or --retry-after has to pass.
+        left = {}
+        left_since = time.time()
+        while not self.stopping:
+            try:
+                rows = self.queue()
+            except Exception as e:  # GitHub down, gh logged out: keep polling
+                self.log(f"job queue failed: {e}")
+                self.save(state="error", error=str(e), last_poll=now())
+                self.sleep(self.interval)
+                continue
+            work = self.work(rows)
+            fresh = [r for k, r in work.items() if k not in left]
+            retry = (self.retry_after and work and not fresh
+                     and time.time() - left_since > self.retry_after * 60)
+            if fresh or retry:
+                self.run_claude(fresh or list(work.values()))
+                if self.stopping:
+                    break
+                try:
+                    left = self.work(self.queue())
+                except Exception as e:
+                    self.log(f"job queue failed after the run: {e}")
+                    left = work
+                left_since = time.time()
+                if left:
+                    self.log("left unfinished, waiting for something new: "
+                             + ", ".join(f"#{r[1]} {r[0]} {r[3]}" for r in left.values()))
+                continue  # poll right away: something may have come in during the run
+            # Forget leftovers that went away, so they trigger again if they come back.
+            left = {k: r for k, r in left.items() if k in work}
+            nxt = datetime.fromtimestamp(time.time() + self.interval, timezone.utc)
+            self.save(state="idle", error=None, last_poll=now(),
+                      next_poll=nxt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      pending=[r[:5] for r in work.values()])
+            self.sleep(self.interval)
+
+
+def lock():
+    """One watcher per checkout. The lock goes when the process does."""
+    f = open(JOBS / ".watch.lock", "w")
+    try:
+        if fcntl:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        s = read_state() or {}
+        sys.exit(f"watch: another watcher is running here (pid {s.get('pid', '?')})")
+    return f
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv == ["status"]:
+        return cmd_status()
+    if argv == ["check"]:
+        return cmd_check()
+
+    claude_args = DEFAULT_CLAUDE_ARGS
+    if "--" in argv:
+        i = argv.index("--")
+        argv, claude_args = argv[:i], argv[i + 1:]
+    opts = {"--interval": 60, "--retry-after": 0, "--run-timeout": 0}
+    while argv:
+        if argv[0] in opts and len(argv) > 1 and argv[1].isdigit():
+            opts[argv[0]] = int(argv[1])
+            argv = argv[2:]
+        else:
+            sys.exit(f"watch: bad arguments: {' '.join(argv)}\n\n{__doc__.strip()}")
+    if opts["--interval"] < 10:
+        sys.exit("watch: --interval must be at least 10 seconds")
+    if not shutil.which("claude"):
+        sys.exit("watch: claude is not on PATH")
+    if os.environ.get(CHILD_ENV):
+        sys.exit("watch: refusing to start a watcher from inside a watcher's run")
+
+    JOBS.mkdir(parents=True, exist_ok=True)
+    held = lock()  # noqa: F841 (kept open for the process's lifetime)
+    w = Watcher(opts["--interval"], opts["--retry-after"], opts["--run-timeout"], claude_args)
+
+    def stop(*_):
+        w.stopping = True
+    # The run is in its own process group, so Ctrl-C reaches only the watcher,
+    # which then stops the run.
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    w.log(f"watching {REPO.name}: polling every {w.interval}s; Ctrl-C to stop")
+    try:
+        w.loop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if w.child and w.child.poll() is None:
+            w.log("stopping the running /factory run; job state is in files, "
+                  "so the next run resumes it")
+            w.stop_child()
+        w.save(state="stopped", pending=[])
+        w.log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)
